@@ -1,8 +1,7 @@
 use anyhow::anyhow;
 use rustls::client::*;
 use rustls::*;
-use std::fmt::Arguments;
-use std::io::{ErrorKind, IoSlice, IoSliceMut, Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::net::TcpStream;
 use std::result::Result;
 use std::sync::Arc;
@@ -115,103 +114,6 @@ impl Stream {
         Ok(())
     }
 
-    pub fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if !self.connected {
-            return Err(std::io::Error::from(ErrorKind::NotConnected));
-        }
-        match &self.socket_type {
-            SocketType::TLS => self.tls_stream.as_mut().unwrap().read(buf),
-            SocketType::TCP => self.tcp_stream.as_mut().unwrap().read(buf),
-        }
-    }
-
-    pub fn read_vectored(&mut self, bufs: &mut [IoSliceMut<'_>]) -> std::io::Result<usize> {
-        if !self.connected {
-            return Err(std::io::Error::from(ErrorKind::NotConnected));
-        }
-        match &self.socket_type {
-            SocketType::TLS => self.tls_stream.as_mut().unwrap().read_vectored(bufs),
-            SocketType::TCP => self.tcp_stream.as_mut().unwrap().read_vectored(bufs),
-        }
-    }
-
-    pub fn read_to_end(&mut self, buf: &mut Vec<u8>) -> std::io::Result<usize> {
-        if !self.connected {
-            return Err(std::io::Error::from(ErrorKind::NotConnected));
-        }
-        match &self.socket_type {
-            SocketType::TLS => self.tls_stream.as_mut().unwrap().read_to_end(buf),
-            SocketType::TCP => self.tcp_stream.as_mut().unwrap().read_to_end(buf),
-        }
-    }
-
-    pub fn read_exact(&mut self, buf: &mut [u8]) -> std::io::Result<()> {
-        if !self.connected {
-            return Err(std::io::Error::from(ErrorKind::NotConnected));
-        }
-        match &self.socket_type {
-            SocketType::TLS => self.tls_stream.as_mut().unwrap().read_exact(buf),
-            SocketType::TCP => self.tcp_stream.as_mut().unwrap().read_exact(buf),
-        }
-    }
-
-    pub fn read_to_string(&mut self, buf: &mut String) -> std::io::Result<usize> {
-        if !self.connected {
-            return Err(std::io::Error::from(ErrorKind::NotConnected));
-        }
-        match &self.socket_type {
-            SocketType::TLS => self.tls_stream.as_mut().unwrap().read_to_string(buf),
-            SocketType::TCP => self.tcp_stream.as_mut().unwrap().read_to_string(buf),
-        }
-    }
-
-    pub fn is_read_vectored(&mut self) -> bool {
-        false
-    }
-
-    pub fn write(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if !self.connected {
-            return Err(std::io::Error::from(ErrorKind::NotConnected));
-        }
-        match &self.socket_type {
-            SocketType::TLS => self.tls_stream.as_mut().unwrap().write(buf),
-            SocketType::TCP => self.tcp_stream.as_mut().unwrap().write(buf),
-        }
-    }
-
-    pub fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
-        if !self.connected {
-            return Err(std::io::Error::from(ErrorKind::NotConnected));
-        }
-        match &self.socket_type {
-            SocketType::TLS => self.tls_stream.as_mut().unwrap().write_all(buf),
-            SocketType::TCP => self.tcp_stream.as_mut().unwrap().write_all(buf),
-        }
-    }
-    pub fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> std::io::Result<usize> {
-        if !self.connected {
-            return Err(std::io::Error::from(ErrorKind::NotConnected));
-        }
-        match &self.socket_type {
-            SocketType::TLS => self.tls_stream.as_mut().unwrap().write_vectored(bufs),
-            SocketType::TCP => self.tcp_stream.as_mut().unwrap().write_vectored(bufs),
-        }
-    }
-
-    pub fn write_fmt(&mut self, fmt: std::fmt::Arguments<'_>) -> std::io::Result<()> {
-        if !self.connected {
-            return Err(std::io::Error::from(ErrorKind::NotConnected));
-        }
-        match &self.socket_type {
-            SocketType::TLS => self.tls_stream.as_mut().unwrap().write_fmt(fmt),
-            SocketType::TCP => self.tcp_stream.as_mut().unwrap().write_fmt(fmt),
-        }
-    }
-
-    pub fn is_write_vectored(&mut self) -> bool {
-        false
-    }
-
     pub fn set_read_timeout(&mut self, dur: Option<Duration>) -> std::io::Result<()> {
         if !self.connected {
             return Err(std::io::Error::from(ErrorKind::NotConnected));
@@ -225,14 +127,37 @@ impl Stream {
         }
         self.tcp_stream.as_mut().unwrap().set_write_timeout(dur)
     }
+}
 
-    pub fn flush(&mut self) -> std::io::Result<()> {
+impl Write for Stream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if !self.connected {
+            return Err(std::io::Error::from(ErrorKind::NotConnected));
+        }
+        match &self.socket_type {
+            SocketType::TLS => self.tls_stream.as_mut().unwrap().write(buf),
+            SocketType::TCP => self.tcp_stream.as_mut().unwrap().write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
         if !self.connected {
             return Err(std::io::Error::from(ErrorKind::NotConnected));
         }
         match &self.socket_type {
             SocketType::TLS => self.tls_stream.as_mut().unwrap().flush(),
             SocketType::TCP => self.tcp_stream.as_mut().unwrap().flush(),
+        }
+    }
+}
+impl Read for Stream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if !self.connected {
+            return Err(std::io::Error::from(ErrorKind::NotConnected));
+        }
+        match &self.socket_type {
+            SocketType::TLS => self.tls_stream.as_mut().unwrap().read(buf),
+            SocketType::TCP => self.tcp_stream.as_mut().unwrap().read(buf),
         }
     }
 }
@@ -254,46 +179,6 @@ impl Qsocket {
             secret: String::from(secret),
             stream: Stream::new(),
         }
-    }
-
-    pub fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.stream.read(buf)
-    }
-    pub fn read_vectored(&mut self, bufs: &mut [IoSliceMut<'_>]) -> std::io::Result<usize> {
-        self.stream.read_vectored(bufs)
-    }
-    pub fn read_to_end(&mut self, buf: &mut Vec<u8>) -> std::io::Result<usize> {
-        self.stream.read_to_end(buf)
-    }
-    pub fn read_to_string(&mut self, buf: &mut String) -> std::io::Result<usize> {
-        self.stream.read_to_string(buf)
-    }
-    pub fn read_exact(&mut self, buf: &mut [u8]) -> std::io::Result<()> {
-        self.stream.read_exact(buf)
-    }
-    pub fn write(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.stream.write(buf)
-    }
-    pub fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
-        self.stream.write_all(buf)
-    }
-    pub fn write_fmt(&mut self, fmt: Arguments<'_>) -> std::io::Result<()> {
-        self.stream.write_fmt(fmt)
-    }
-    pub fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> std::io::Result<usize> {
-        self.stream.write_vectored(bufs)
-    }
-    pub fn is_write_vectored(&mut self) -> bool {
-        self.stream.is_write_vectored()
-    }
-    pub fn set_read_timeout(&mut self, dur: Option<Duration>) -> std::io::Result<()> {
-        self.stream.set_read_timeout(dur)
-    }
-    pub fn set_write_timeout(&mut self, dur: Option<Duration>) -> std::io::Result<()> {
-        self.stream.set_write_timeout(dur)
-    }
-    pub fn flush(&mut self) -> std::io::Result<()> {
-        self.stream.flush()
     }
 
     pub fn dial_tcp(&mut self) -> Result<(), anyhow::Error> {
@@ -346,45 +231,16 @@ impl Qsocket {
 
 impl Write for Qsocket {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.write(buf.to_owned().as_mut())
+        self.stream.write(buf)
     }
     fn flush(&mut self) -> std::io::Result<()> {
-        self.flush()
-    }
-
-    fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> std::io::Result<usize> {
-        self.write_vectored(bufs)
-    }
-
-    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
-        self.write_all(buf)
-    }
-
-    fn write_fmt(&mut self, fmt: Arguments<'_>) -> std::io::Result<()> {
-        self.write_fmt(fmt)
-    }
-
-    fn by_ref(&mut self) -> &mut Self {
-        self
+        self.stream.flush()
     }
 }
 
 impl Read for Qsocket {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.read(buf)
-    }
-    fn read_vectored(&mut self, bufs: &mut [IoSliceMut<'_>]) -> std::io::Result<usize> {
-        self.read_vectored(bufs)
-    }
-    fn read_to_end(&mut self, buf: &mut Vec<u8>) -> std::io::Result<usize> {
-        self.read_to_end(buf)
-    }
-    fn read_to_string(&mut self, buf: &mut String) -> std::io::Result<usize> {
-        self.read_to_string(buf)
-    }
-
-    fn by_ref(&mut self) -> &mut Self {
-        self
+        self.stream.read(buf)
     }
 }
 
