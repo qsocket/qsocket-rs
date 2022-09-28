@@ -1,0 +1,17 @@
+[package]
+name = "qsocket-rs"
+version = "0.1.0"
+edition = "2021"
+authors = ["Ege BALIC <egebalci@pm.me>"]
+description = "Qsocket microphone utility."
+repository = "https://github.com/qsocket/qsocket-rs"
+license = "MIT"
+
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[dependencies]
+# native-tls = "0.2.10"
+sha256 = "1.0.3"
+md5 = "0.7.0"
+anyhow = "1.0.60"
+rustls = { version = "0.20.6", features = ["dangerous_configuration"] }
