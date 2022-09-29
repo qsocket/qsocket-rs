@@ -113,20 +113,6 @@ impl Stream {
         self.socket_type = SocketType::TLS;
         Ok(())
     }
-
-    pub fn set_read_timeout(&mut self, dur: Option<Duration>) -> std::io::Result<()> {
-        if !self.connected {
-            return Err(std::io::Error::from(ErrorKind::NotConnected));
-        }
-        self.tcp_stream.as_mut().unwrap().set_read_timeout(dur)
-    }
-
-    pub fn set_write_timeout(&mut self, dur: Option<Duration>) -> std::io::Result<()> {
-        if !self.connected {
-            return Err(std::io::Error::from(ErrorKind::NotConnected));
-        }
-        self.tcp_stream.as_mut().unwrap().set_write_timeout(dur)
-    }
 }
 
 impl Write for Stream {
@@ -226,6 +212,28 @@ impl Qsocket {
             return self.dial_tls(verify_cert);
         }
         self.dial_tcp()
+    }
+
+    pub fn set_read_timeout(&mut self, dur: Option<Duration>) -> std::io::Result<()> {
+        if !self.stream.connected {
+            return Err(std::io::Error::from(ErrorKind::NotConnected));
+        }
+        self.stream
+            .tcp_stream
+            .as_mut()
+            .unwrap()
+            .set_read_timeout(dur)
+    }
+
+    pub fn set_write_timeout(&mut self, dur: Option<Duration>) -> std::io::Result<()> {
+        if !self.stream.connected {
+            return Err(std::io::Error::from(ErrorKind::NotConnected));
+        }
+        self.stream
+            .tcp_stream
+            .as_mut()
+            .unwrap()
+            .set_write_timeout(dur)
     }
 }
 
