@@ -1,7 +1,14 @@
 use anyhow::anyhow;
+use blake2::Blake2s256;
+use rand::rngs::OsRng;
+use rand::RngCore;
 use rustls::client::*;
 use rustls::*;
 use sha2::{Digest, Sha256};
+
+use srp::client::SrpClient;
+use srp::groups::G_4096;
+use srp::server::SrpServer;
 use std::io::{ErrorKind, Read, Write};
 use std::net::TcpStream;
 use std::result::Result;
@@ -313,6 +320,59 @@ impl QSocket {
             KNOCK_FAIL => Err(anyhow!(ERR_KNOCK_FAILED)),
             _ => Err(anyhow!(ERR_INVALID_KNOCK_RESPONSE)),
         }
+    }
+
+    fn init_client_srp(&mut self) {
+        let mut hasher = Sha256::new();
+        let username = md5::compute(self.secret.clone());
+        hasher.update(self.secret.clone());
+        let password = hasher.finalize();
+
+        let client = SrpClient::<Blake2s256>::new(&G_4096);
+        let mut salt = [0u8; 16];
+        rand::rngs::OsRng.fill_bytes(&mut salt);
+        let verifier =
+            client.compute_verifier(format!("{:x}", username).as_bytes(), &password[..], &salt);
+        // 1. Client sends username and verifier and salt to the Server for storage
+
+        // Client computes the public A value and the clientVerifier containing the key, m1, and m2
+        // let mut a = [0u8; 64];
+        // rng.fill_bytes(&mut a);
+        // let client_verifier = client
+        //     .process_reply(&a, username, auth_pwd, salt, &b_pub)
+        //     .unwrap();
+        // let a_pub = client.compute_public_ephemeral(&a);
+        // let client_proof = client_verifier.proof();
+        // 4. Client sends a_pub and client_proof to server (M1)
+
+        // 6. Client receives verification data and verifies server
+        //    println!("Server verification on client");
+        //    client_verifier.verify_server(server_proof).unwrap();
+        //    let client_key = client_verifier.key();
+    }
+
+    fn init_server_srp(&mut self) {
+        let mut hasher = Sha256::new();
+        let username = md5::compute(self.secret.clone());
+        hasher.update(self.secret.clone());
+        let password = hasher.finalize();
+        let server = SrpServer::<Sha256>::new(&G_4096);
+
+        // 2. Server retrieves verifier, salt and computes a public B value
+        // let mut b = [0u8; 64];
+        // rand::rngs::OsRng.fill_bytes(&mut b);
+        // let (salt, b_pub) = (&salt, server.compute_public_ephemeral(&b, &verifier));
+
+        // 3. Server sends salt and b_pub to client
+
+        // 5. Server processes verification data
+        // let server_verifier = server.process_reply(&b, &verifier, &a_pub).unwrap();
+        // println!("Client verification on server");
+        // server_verifier.verify_client(client_proof).unwrap();
+        // let server_proof = server_verifier.proof();
+        // let server_key = server_verifier.key();
+
+        // 7. Server sends server_proof to server (M2)
     }
 
     /// Sets the read timeout to the timeout specified.
