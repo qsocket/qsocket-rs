@@ -16,5 +16,9 @@ anyhow = "1.0.60"
 rustls = { version = "0.20.6", features = ["dangerous_configuration"] }
 sha2 = "0.10.6"
 srp = "0.6.0"
-blake2 = "0.10.6"
 rand = "0.8.5"
+hex = "0.4.3"
+
+
+[dependencies.blake2]
+path = "../blake2"

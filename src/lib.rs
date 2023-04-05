@@ -1,5 +1,6 @@
-use anyhow::anyhow;
-use blake2::Blake2s256;
+use anyhow::{anyhow, Ok};
+//use blake2::digest::{Update, VariableOutput};
+use blake2::{Blake2b256, Blake2bVar};
 use rand::rngs::OsRng;
 use rand::RngCore;
 use rustls::client::*;
@@ -12,7 +13,7 @@ use srp::server::SrpServer;
 use std::io::{ErrorKind, Read, Write};
 use std::net::TcpStream;
 use std::result::Result;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 // QSocket constants
@@ -32,6 +33,9 @@ pub const ERR_CERT_FINGERPRINT_MISMATCH: &str = "Certificate fingerprint mismatc
 pub const ERR_SOCKET_NOT_INITIALIZED: &str = "Socket not initialized!";
 pub const ERR_SOCKET_NOT_CONNECTED: &str = "Socket not connected.";
 pub const ERR_INVALID_PEER_ID_TAG: &str = "Invalid peer ID tag.";
+pub const ERR_INVALID_SRP_CREDS: &str = "Invalid SRP creds.";
+pub const ERR_SRP_PROOF_FAILED: &str = "SRP proof check failed.";
+pub const ERR_SOCKET_IN_USE: &str = "socket already dialed.";
 
 // Tags
 // 000 000 0 0
@@ -224,6 +228,20 @@ impl QSocket {
         }
     }
 
+    /// Returns true if the QSocket is set to client mode.
+    ///
+    /// # Examples
+    /// ```no_run
+    /// use qsocket;
+    ///
+    /// let mut qsock = qsocket::QSocket::new("my-secret", true);
+    /// qsock.add_id_tag(qsocket::peer_id_tag::CLIENT);
+    /// assert_eq!(qsock.is_client(), true);
+    /// ```
+    pub fn is_client(&mut self) -> bool {
+        self.tag % 2 == 1
+    }
+
     /// Adds a new ID tag to the quantum socket.
     ///
     /// `secret` value can be considered as the password for the QSocket connection,
@@ -233,18 +251,40 @@ impl QSocket {
     /// ```no_run
     /// use qsocket;
     ///
-    /// let mut qsock = qsocket::QSocket::new("my-secret", false);
+    /// let mut qsock = qsocket::QSocket::new("my-secret");
     /// if let Err(e) = qsock.add_id_tag(qsocket::peer_id_tag::CLIENT) {
     ///     panic!("{}", e);
     /// }
     /// ```
     pub fn add_id_tag(&mut self, id_tag: u8) -> Result<(), anyhow::Error> {
+        if self.stream.connected {
+            return Err(anyhow!(ERR_SOCKET_IN_USE));
+        }
         match id_tag {
             peer_id_tag::CLIENT => self.tag |= id_tag,
             peer_id_tag::SERVER => self.tag |= id_tag,
             peer_id_tag::PROXY => self.tag |= id_tag,
             _ => return Err(anyhow!(ERR_INVALID_PEER_ID_TAG)),
         }
+        Ok(())
+    }
+
+    /// Enables/Disabled the TLS certificate pinning behavior of the quantum socket.
+    ///
+    /// # Examples
+    /// ```no_run
+    /// use qsocket;
+    ///
+    /// let mut qsock = qsocket::QSocket::new("my-secret");
+    /// if let Err(e) = qsock.add_id_tag(qsocket::peer_id_tag::CLIENT) {
+    ///     panic!("{}", e);
+    /// }
+    /// ```
+    pub fn set_cert_pinning(&mut self, v: bool) -> Result<(), anyhow::Error> {
+        if self.stream.connected {
+            return Err(anyhow!(ERR_SOCKET_IN_USE));
+        }
+        self.verify_cert = v;
         Ok(())
     }
 
@@ -257,7 +297,7 @@ impl QSocket {
     /// Examples
     /// ```no_run
     /// use qsocket;
-    /// let mut qsock = qsocket::QSocket::new("my-secret", false);
+    /// let mut qsock = qsocket::QSocket::new("my-secret");
     /// if let Err(e) = qsock.dial_tcp() {           
     ///     panic!("{}", e);
     /// }
@@ -315,64 +355,166 @@ impl QSocket {
         let mut resp = vec![1];
         self.stream.read_exact(resp.as_mut())?;
         match resp[0] {
-            KNOCK_SUCCESS => Ok(()),
-            KNOCK_BUSY => Err(anyhow!(ERR_KNOCK_BUSY)),
-            KNOCK_FAIL => Err(anyhow!(ERR_KNOCK_FAILED)),
-            _ => Err(anyhow!(ERR_INVALID_KNOCK_RESPONSE)),
+            KNOCK_SUCCESS => (),
+            KNOCK_BUSY => return Err(anyhow!(ERR_KNOCK_BUSY)),
+            KNOCK_FAIL => return Err(anyhow!(ERR_KNOCK_FAILED)),
+            _ => return Err(anyhow!(ERR_INVALID_KNOCK_RESPONSE)),
+        };
+
+        let mut session_key: Vec<u8>;
+        if self.is_client() {
+            session_key = self.init_client_srp()?;
+        } else {
+            session_key = self.init_server_srp()?;
         }
+
+        // Begin E2E encryption
+
+        Ok(())
     }
 
-    fn init_client_srp(&mut self) {
-        let mut hasher = Sha256::new();
-        let username = md5::compute(self.secret.clone());
-        hasher.update(self.secret.clone());
-        let password = hasher.finalize();
+    fn init_client_srp(&mut self) -> Result<Vec<u8>, anyhow::Error> {
+        let myself = Arc::new(Mutex::new(self));
 
-        let client = SrpClient::<Blake2s256>::new(&G_4096);
-        let mut salt = [0u8; 16];
-        rand::rngs::OsRng.fill_bytes(&mut salt);
-        let verifier =
-            client.compute_verifier(format!("{:x}", username).as_bytes(), &password[..], &salt);
-        // 1. Client sends username and verifier and salt to the Server for storage
+        if myself.lock().unwrap().stream.connected {
+            return Err(anyhow!(ErrorKind::NotConnected));
+        }
 
-        // Client computes the public A value and the clientVerifier containing the key, m1, and m2
-        // let mut a = [0u8; 64];
-        // rng.fill_bytes(&mut a);
-        // let client_verifier = client
-        //     .process_reply(&a, username, auth_pwd, salt, &b_pub)
-        //     .unwrap();
-        // let a_pub = client.compute_public_ephemeral(&a);
-        // let client_proof = client_verifier.proof();
-        // 4. Client sends a_pub and client_proof to server (M1)
+        let (user, pass) = myself.lock().unwrap().get_srp_creds();
+        let client = SrpClient::<Blake2b256>::new(&G_4096);
 
-        // 6. Client receives verification data and verifies server
-        //    println!("Server verification on client");
-        //    client_verifier.verify_server(server_proof).unwrap();
-        //    let client_key = client_verifier.key();
+        // send handshake data (username and a_pub) to the server:
+        let mut a = [0u8; 64];
+        OsRng.fill_bytes(&mut a);
+        let a_pub = client.compute_public_ephemeral(&a);
+
+        myself
+            .lock()
+            .unwrap()
+            .stream
+            .write_all(format!("{:x?}:{:x?}", user, a_pub.as_slice()).as_bytes())?;
+
+        // receive salt and b_pub
+        let mut buf = [0u8; 4096];
+        let n = myself.lock().unwrap().stream.read(&mut buf)?;
+        let salt_n_b_pub = format!("{:?}", &buf[0..n]);
+
+        if salt_n_b_pub.split_once(':').is_none() {
+            return Err(anyhow!(ERR_INVALID_SRP_CREDS));
+        }
+
+        let (salt_srt, b_pub_str) = salt_n_b_pub.split_once(':').unwrap();
+        let salt = hex::decode(salt_srt)?;
+        let b_pub = hex::decode(b_pub_str)?;
+
+        let verifier = match client.process_reply(
+            &a,
+            user.as_slice(),
+            pass.as_slice(),
+            salt.as_slice(),
+            b_pub.as_slice(),
+        ) {
+            std::result::Result::Ok(v) => v,
+            Err(e) => return Err(anyhow!(e)),
+        };
+
+        myself
+            .lock()
+            .unwrap()
+            .stream
+            .write_all(format!("{:x?}", verifier.proof()).as_bytes())?;
+
+        let mut buf = [0u8; 4096];
+        let n = myself.lock().unwrap().stream.read(&mut buf)?;
+
+        if verifier.verify_server(&buf[0..n]).is_err() {
+            return Err(anyhow!(ERR_SRP_PROOF_FAILED));
+        }
+
+        Ok(verifier.key().to_vec())
     }
 
-    fn init_server_srp(&mut self) {
+    fn init_server_srp(&mut self) -> Result<Vec<u8>, anyhow::Error> {
+        let myself = Arc::new(Mutex::new(self));
+        if !myself.lock().unwrap().stream.connected {
+            return Err(anyhow!(ErrorKind::NotConnected));
+        }
+
+        let (user, pass) = myself.lock().unwrap().get_srp_creds();
+        dbg!(hex::encode(user.clone()), hex::encode(pass.clone()));
+        let server = SrpServer::<Blake2b256>::new(&G_4096);
+
+        let mut salt = [0u8; 512];
+        OsRng.fill_bytes(&mut salt);
+        let cli = SrpClient::<Blake2b256>::new(&G_4096);
+        let vi = cli.compute_verifier(user.as_slice(), pass.as_slice(), &salt);
+
+        let mut buf = [0u8; 4096];
+        let n = myself.lock().unwrap().stream.read(&mut buf)?;
+        dbg!(n);
+        let creds = std::str::from_utf8(&buf[0..n])?;
+        dbg!(" == CLIENT ==> ", creds);
+
+        // if !creds.contains(':') {
+        //     return Err(anyhow!(ERR_INVALID_SRP_CREDS));
+        // }
+
+        let (username, a_pub_str) = creds.split_once(':').unwrap();
+        let a_pub = hex::decode(a_pub_str)?;
+        let user_str = hex::encode(user);
+        dbg!(user_str.clone());
+
+        // if username != user_str.as_str() {
+        //     return Err(anyhow!(ERR_INVALID_SRP_CREDS));
+        // }
+
+        let mut b = [0u8; 512]; // Should be 512
+        OsRng.fill_bytes(&mut b);
+        let b_pub = server.compute_public_ephemeral(&b, &vi);
+
+        myself
+            .lock()
+            .unwrap()
+            .stream
+            .write_all(format!("{}:{}", hex::encode(b), hex::encode(b_pub.clone())).as_bytes())?;
+
+        dbg!(
+            "<=== SERVER == ",
+            format!("{}:{}", hex::encode(b), hex::encode(b_pub))
+        );
+
+        let verifier = match server.process_reply(&b, &vi, a_pub.as_slice()) {
+            std::result::Result::Ok(v) => v,
+            Err(e) => return Err(anyhow!(e)),
+        };
+
+        let n = myself.lock().unwrap().stream.read(&mut buf)?;
+        dbg!(n);
+        // let proof = format!("{:x?}", &buf[0..n]);
+        dbg!("== CLIENT ===> ", hex::encode(&buf[0..n]));
+
+        if verifier.verify_client(&buf[0..n]).is_err() {
+            return Err(anyhow!(ERR_SRP_PROOF_FAILED));
+        }
+
+        myself
+            .lock()
+            .unwrap()
+            .stream
+            .write_all(hex::encode(verifier.proof()).as_bytes())?;
+
+        dbg!(verifier.key());
+        Ok(verifier.key().to_vec())
+    }
+
+    fn get_srp_creds(&mut self) -> (Vec<u8>, Vec<u8>) {
+        let username_md5 = md5::compute(self.secret.clone());
+        // let username = blake2b256(username_md5.as_slice()).unwrap(); // blake3::hash(username_md5.as_slice());
         let mut hasher = Sha256::new();
-        let username = md5::compute(self.secret.clone());
         hasher.update(self.secret.clone());
-        let password = hasher.finalize();
-        let server = SrpServer::<Sha256>::new(&G_4096);
-
-        // 2. Server retrieves verifier, salt and computes a public B value
-        // let mut b = [0u8; 64];
-        // rand::rngs::OsRng.fill_bytes(&mut b);
-        // let (salt, b_pub) = (&salt, server.compute_public_ephemeral(&b, &verifier));
-
-        // 3. Server sends salt and b_pub to client
-
-        // 5. Server processes verification data
-        // let server_verifier = server.process_reply(&b, &verifier, &a_pub).unwrap();
-        // println!("Client verification on server");
-        // server_verifier.verify_client(client_proof).unwrap();
-        // let server_proof = server_verifier.proof();
-        // let server_key = server_verifier.key();
-
-        // 7. Server sends server_proof to server (M2)
+        let password_sha256 = hasher.finalize();
+        //let password = blake2b256(&password_sha256).unwrap(); // blake3::hash(&password_sha256);
+        (username_md5.to_vec(), password_sha256.to_vec())
     }
 
     /// Sets the read timeout to the timeout specified.
@@ -398,7 +540,7 @@ impl QSocket {
     /// use core::time::Duration;
     /// use std::io::ErrorKind::InvalidInput;
     ///
-    /// let mut qsock = qsocket::QSocket::new("my-secret", false);
+    /// let mut qsock = qsocket::QSocket::new("my-secret");
     /// if let Err(e) = qsock.dial(){
     ///     panic!("{}", e);
     /// }
@@ -439,7 +581,7 @@ impl QSocket {
     /// use qsocket;
     /// use core::time::Duration;
     ///
-    /// let mut qsock = qsocket::QSocket::new("my-secret", false);
+    /// let mut qsock = qsocket::QSocket::new("my-secret");
     /// if let Err(e) = qsock.dial(){
     ///     panic!("{}", e);
     /// }
@@ -479,7 +621,7 @@ impl QSocket {
     /// use std::io::Read;
     /// use std::io::ErrorKind::WouldBlock;
     ///
-    /// let mut qsock = qsocket::QSocket::new("my-secret", false);
+    /// let mut qsock = qsocket::QSocket::new("my-secret");
     /// if let Err(e) = qsock.dial() {
     ///     panic!("{}", e)
     /// }
@@ -530,7 +672,7 @@ impl QSocket {
     /// use qsocket;
     /// use std::net::Shutdown;
     ///
-    /// let mut qsock = qsocket::QSocket::new("my-secret", false);
+    /// let mut qsock = qsocket::QSocket::new("my-secret");
     /// if let Err(e) = qsock.dial() {
     ///     panic!("{}", e);
     /// }
@@ -570,7 +712,7 @@ impl ServerCertVerifier for NoCertificateVerification {
         _ocsp_response: &[u8],
         _now: std::time::SystemTime,
     ) -> Result<ServerCertVerified, Error> {
-        Ok(ServerCertVerified::assertion())
+        std::result::Result::Ok(ServerCertVerified::assertion())
     }
 }
 
@@ -619,7 +761,7 @@ pub fn new_knock_sequence(secret: &str, tag: u8) -> Result<[u8; 20], std::io::Er
     knock[2] = calc_checksum(digest.as_slice(), KNOCK_CHECKSUM_BASE);
     digest.as_slice().read_exact(knock[3..19].as_mut())?;
     knock[19] = tag;
-    Ok(knock)
+    std::result::Result::Ok(knock)
 }
 
 /// Calculates a 8bit checksum value for the given byte array.
@@ -718,3 +860,12 @@ pub fn get_default_tag() -> u8 {
 
     tag
 }
+
+// fn blake2b256(input: &[u8]) -> Result<Vec<u8>, anyhow::Error> {
+//     use blake2::digest::{Update, VariableOutput};
+//     let mut hasher = Blake2bVar::new(32).unwrap();
+//     hasher.update(input);
+//     let mut buf = [0u8; 32];
+//     hasher.finalize_variable(&mut buf).unwrap();
+//     Ok(buf.to_vec())
+// }
