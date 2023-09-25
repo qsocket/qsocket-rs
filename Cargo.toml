@@ -1,6 +1,6 @@
 [package]
 name = "qsocket"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 authors = ["Ege BALCI <egebalci@pm.me>"]
 description = "QSocket library."
@@ -15,10 +15,10 @@ md5 = "0.7.0"
 anyhow = "1.0.60"
 rustls = { version = "0.20.6", features = ["dangerous_configuration"] }
 sha2 = "0.10.6"
-srp = "0.6.0"
 rand = "0.8.5"
 hex = "0.4.3"
-
-
-[dependencies.blake2]
-path = "../blake2"
+base64 = "0.21.4"
+httparse = "1.8.0"
+thiserror = "1.0.48"
+spake2 = "0.4.0"
+chacha20 = "0.9.1"

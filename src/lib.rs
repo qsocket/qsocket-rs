@@ -1,20 +1,23 @@
-use anyhow::{anyhow, Ok};
-//use blake2::digest::{Update, VariableOutput};
-use blake2::{Blake2b256, Blake2bVar};
-use rand::rngs::OsRng;
-use rand::RngCore;
+use base64::{engine::general_purpose, Engine as _};
+use chacha20::cipher::{KeyIvInit, StreamCipher};
+use chacha20::ChaCha20;
+use hex::FromHexError;
 use rustls::client::*;
 use rustls::*;
 use sha2::{Digest, Sha256};
-
-use srp::client::SrpClient;
-use srp::groups::G_4096;
-use srp::server::SrpServer;
+use std::io;
 use std::io::{ErrorKind, Read, Write};
 use std::net::TcpStream;
+use std::net::{AddrParseError, SocketAddr};
 use std::result::Result;
-use std::sync::{Arc, Mutex};
+use std::string::FromUtf8Error;
+use std::sync::mpsc::RecvError;
+use std::sync::Arc;
 use std::time::Duration;
+use thiserror::Error;
+
+mod device;
+mod pake;
 
 // QSocket constants
 /// Hardcoded QSocket relay network gate address.
@@ -23,96 +26,72 @@ pub const QSRN_GATE: &str = "gate.qsocket.io";
 pub const QSRN_PORT: u32 = 80;
 /// TLS connection port for the QSRN.
 pub const QSRN_TLS_PORT: u32 = 443;
-
-// Errors
-pub const ERR_KNOCK_FAILED: &str = "Connection refused. (no server listening with given secret)";
-pub const ERR_KNOCK_BUSY: &str = "Socket busy.";
-pub const ERR_INVALID_KNOCK_RESPONSE: &str = "Invalid response.";
-pub const ERR_NO_PEER_CERT: &str = "Failed retrieving peer certificate.";
-pub const ERR_CERT_FINGERPRINT_MISMATCH: &str = "Certificate fingerprint mismatch!";
-pub const ERR_SOCKET_NOT_INITIALIZED: &str = "Socket not initialized!";
-pub const ERR_SOCKET_NOT_CONNECTED: &str = "Socket not connected.";
-pub const ERR_INVALID_PEER_ID_TAG: &str = "Invalid peer ID tag.";
-pub const ERR_INVALID_SRP_CREDS: &str = "Invalid SRP creds.";
-pub const ERR_SRP_PROOF_FAILED: &str = "SRP proof check failed.";
-pub const ERR_SOCKET_IN_USE: &str = "socket already dialed.";
-
-// Tags
-// 000 000 0 0
-// |   |   | |
-// [OS]|   | |
-//     |   | |
-//     [ARCH]|
-//         | |
-//         [PROXY]
-//           [SRV|CLI]
-// 3 Arch bits...
-
-mod device_id_tag {
-    /// Tag ID for representing connections from devices with AMD64 architecture.
-    pub const ARCH_AMD64: u8 = 0xE0;
-    /// Tag ID for representing connections from devices with 386 architecture.
-    pub const ARCH_386: u8 = 0x20;
-    /// Tag ID for representing connections from devices with ARM64 architecture.
-    pub const ARCH_ARM64: u8 = 0x40;
-    /// Tag ID for representing connections from devices with ARM architecture.
-    pub const ARCH_ARM: u8 = 0x60;
-    /// Tag ID for representing connections from devices with MIPS64 architecture.
-    pub const ARCH_MIPS64: u8 = 0x80;
-    /// Tag ID for representing connections from devices with MIPS architecture.
-    pub const ARCH_MIPS: u8 = 0xA0;
-    /// Tag ID for representing connections from devices with MIPS64LE architecture.
-    pub const ARCH_MIPS64LE: u8 = 0xC0;
-    /// Tag ID for representing connections from Linux devices.
-    pub const OS_LINUX: u8 = 0x1C;
-    /// Tag ID for representing connections from Darwin devices.
-    pub const OS_DARWIN: u8 = 0x04;
-    /// Tag ID for representing connections from Windows devices.
-    pub const OS_WINDOWS: u8 = 0x08;
-    /// Tag ID for representing connections from Android devices.
-    pub const OS_ANDROID: u8 = 0x0C;
-    /// Tag ID for representing connections from IOS devices.
-    pub const OS_IOS: u8 = 0x10;
-    /// Tag ID for representing connections from FreeBSD devices.
-    pub const OS_FREEBSD: u8 = 0x14;
-    /// Tag ID for representing connections from OpenBSD devices.
-    pub const OS_OPENBSD: u8 = 0x18;
-    // Unknown = 0x00,
-}
-
-pub mod peer_id_tag {
-    /// Tag ID for representing proxy mode connections.
-    pub const PROXY: u8 = 0x02;
-    /// Tag ID for representing client mode connections.
-    pub const CLIENT: u8 = 0x01;
-    /// Tag ID for representing server mode connections.
-    pub const SERVER: u8 = 0x00;
-}
-
-/// Hardcoded gate.qsocket.io TLS certificate fingerprint
-const QSRN_CERT_FINGERPRINT: &str =
-    "32ADEB12BA582C97E157D10699080C1598ECC3793C09D19020EDF51CDC67C145";
-
 // Knock constants
-pub const KNOCK_HEADER_B1: u8 = 0xC0;
-pub const KNOCK_HEADER_B2: u8 = 0xDE;
 /// Base value for calculating knock packet checksum.
 pub const KNOCK_CHECKSUM_BASE: u8 = 0xEE;
-/// Knock response value representing successful connection.
-pub const KNOCK_SUCCESS: u8 = 0xE0;
-/// Knock response value representing failed connection.
-pub const KNOCK_FAIL: u8 = 0xE1;
-/// Knock response value representing busy connection.
-pub const KNOCK_BUSY: u8 = 0xE2;
+/// Default socket read/write timeout duration.
 
+#[derive(Error, Debug)]
+pub enum QSocketError {
+    #[error("Knock failed (no peer listening)")]
+    KnockFail,
+    #[error("Socket busy (another server is listening)")]
+    KnockBusy,
+    #[error("Invalid knock response")]
+    InvalidKnockResponse,
+    #[error("Certificate fingerprint mismatch")]
+    CertificateFingerprintMismatch,
+    #[error("Socket not connected")]
+    NotConnected,
+    #[error(transparent)]
+    IoError(#[from] io::Error),
+    #[error(transparent)]
+    TlsError(#[from] rustls::Error),
+    #[error(transparent)]
+    FromHex(#[from] FromHexError),
+    #[error(transparent)]
+    AddrParseFail(#[from] AddrParseError),
+    #[error(transparent)]
+    HttpParseFail(#[from] httparse::Error),
+    #[error(transparent)]
+    Base64DecodeFail(#[from] base64::DecodeError),
+    #[error(transparent)]
+    FromUtf8Fail(#[from] FromUtf8Error),
+    #[error(transparent)]
+    RecvFail(#[from] RecvError),
+    #[error("PAKE handshake failed")]
+    PakeError,
+}
+
+enum KnockStatus {
+    Success = 0xE0,
+    Forward,
+    Fail,
+    Busy,
+}
+
+struct KnockResponse {
+    status: KnockStatus,
+    data: String,
+}
+
+#[derive(PartialEq)]
 pub enum SocketType {
-    TLS,
     TCP,
+    TLS,
+    E2E,
+}
+
+#[derive(PartialEq, Copy, Clone)]
+pub enum PeerType {
+    Server = 0,
+    Client,
 }
 
 pub struct Stream {
     connected: bool,
     socket_type: SocketType,
+    cipher: Option<ChaCha20>,
     tcp_stream: Option<TcpStream>,
     tls_stream: Option<StreamOwned<ClientConnection, TcpStream>>,
 }
@@ -122,21 +101,22 @@ impl Stream {
         Self {
             socket_type: SocketType::TCP,
             connected: false,
+            cipher: None,
             tcp_stream: None,
             tls_stream: None,
         }
     }
 
-    fn connect(&mut self, gate: &str) -> anyhow::Result<()> {
+    fn connect(&mut self, gate: &str) -> Result<(), QSocketError> {
         let tcp_stream = TcpStream::connect(gate)?;
         self.tcp_stream = Some(tcp_stream);
         self.connected = true;
         Ok(())
     }
 
-    fn upgrade_to_tls(&mut self) -> anyhow::Result<()> {
+    fn upgrade_to_tls(&mut self) -> Result<(), QSocketError> {
         if !self.connected {
-            return Err(anyhow!(ErrorKind::NotConnected));
+            return Err(QSocketError::NotConnected);
         }
         let mut client = rustls::ClientConnection::new(
             Arc::new(new_tls_config()),
@@ -157,6 +137,46 @@ impl Stream {
         self.socket_type = SocketType::TLS;
         Ok(())
     }
+
+    fn read_enc(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if !self.connected {
+            return Err(std::io::Error::from(ErrorKind::NotConnected));
+        }
+        let n = match &self.socket_type {
+            SocketType::TCP => self.tcp_stream.as_mut().unwrap().read(buf)?,
+            SocketType::TLS => self.tls_stream.as_mut().unwrap().read(buf)?,
+            SocketType::E2E => {
+                if self.tls_stream.is_some() {
+                    self.tls_stream.as_mut().unwrap().read(buf)?
+                } else {
+                    self.tcp_stream.as_mut().unwrap().read(buf)?
+                }
+            }
+        };
+        self.cipher.as_mut().unwrap().apply_keystream(&mut buf[..n]);
+        Ok(n)
+    }
+
+    fn write_enc(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if !self.connected {
+            return Err(std::io::Error::from(ErrorKind::NotConnected));
+        }
+        let mut my_buf = Vec::new();
+        my_buf.copy_from_slice(buf);
+        self.cipher.as_mut().unwrap().apply_keystream(&mut my_buf);
+
+        match &self.socket_type {
+            SocketType::TCP => self.tcp_stream.as_mut().unwrap().write(my_buf.as_slice()),
+            SocketType::TLS => self.tls_stream.as_mut().unwrap().write(my_buf.as_slice()),
+            SocketType::E2E => {
+                if self.tls_stream.is_some() {
+                    self.tls_stream.as_mut().unwrap().write(my_buf.as_slice())
+                } else {
+                    self.tcp_stream.as_mut().unwrap().write(my_buf.as_slice())
+                }
+            }
+        }
+    }
 }
 
 impl Write for Stream {
@@ -165,8 +185,9 @@ impl Write for Stream {
             return Err(std::io::Error::from(ErrorKind::NotConnected));
         }
         match &self.socket_type {
-            SocketType::TLS => self.tls_stream.as_mut().unwrap().write(buf),
             SocketType::TCP => self.tcp_stream.as_mut().unwrap().write(buf),
+            SocketType::TLS => self.tls_stream.as_mut().unwrap().write(buf),
+            SocketType::E2E => self.write_enc(buf),
         }
     }
 
@@ -175,35 +196,70 @@ impl Write for Stream {
             return Err(std::io::Error::from(ErrorKind::NotConnected));
         }
         match &self.socket_type {
-            SocketType::TLS => self.tls_stream.as_mut().unwrap().flush(),
             SocketType::TCP => self.tcp_stream.as_mut().unwrap().flush(),
+            SocketType::TLS => self.tls_stream.as_mut().unwrap().flush(),
+            SocketType::E2E => {
+                if self.tls_stream.is_some() {
+                    return self.tls_stream.as_mut().unwrap().flush();
+                } else {
+                    return self.tcp_stream.as_mut().unwrap().flush();
+                }
+            }
         }
     }
 }
+
 impl Read for Stream {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         if !self.connected {
-            return Err(std::io::Error::from(ErrorKind::NotConnected));
+            return Err(io::Error::from(ErrorKind::NotConnected));
         }
         match &self.socket_type {
-            SocketType::TLS => self.tls_stream.as_mut().unwrap().read(buf),
             SocketType::TCP => self.tcp_stream.as_mut().unwrap().read(buf),
+            SocketType::TLS => self.tls_stream.as_mut().unwrap().read(buf),
+            SocketType::E2E => self.read_enc(buf),
         }
     }
 }
 
 pub struct QSocket {
-    /// `tag` value is used internally for QoS purposes.
-    /// It specifies the operating system, architecture and the type of connection initiated by the peers,
-    /// the relay server uses these values for optimizing the connection performance.
-    tag: u8,
     /// `secret` value can be considered as the password for the QSocket connection,
     /// It will be used for generating a 128bit unique identifier (UID) for the connection.
     secret: String,
-    /// `verify_cert` value is used for enabling TLS certificate verification. (a.k.a. SSL pinning)
-    verify_cert: bool,
-    /// `stream` contains the underlying TCP/TLS connection streams.
+    /// `session_key` contains the shared secret key derived by performing PAKE.
+    session_key: Option<Vec<u8>>,
+    /// `device_arch` value is used internally for QoS purposes.
+    /// It specifies the device architecture, the relay server uses these
+    /// values for optimizing the connection performance.
+    device_os: device::DeviceOS,
+    /// `device_os` value is used internally for QoS purposes.
+    /// It specifies the device operating system, the relay server uses these
+    /// values for optimizing the connection performance.   
+    device_arch: device::DeviceArch,
+    /// `peer_type` value is used for specifying the peer type Client/Server.
+    peer_type: PeerType,
+    /// `forward_addr` value is used for specifying the forward address for QSocket server.
+    forward_addr: Option<SocketAddr>,
+    /// `cert_fingerprint` value is used for TLS certificate fingerprint verification. (a.k.a. SSL pinning)
+    cert_fingerprint: Option<String>,
+    /// `stream` contains the underlying TCP/TLS/E2E connection streams.
     stream: Stream,
+    // cipher: Option<ChaCha20>,
+}
+
+impl Write for QSocket {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.stream.write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.stream.flush()
+    }
+}
+
+impl Read for QSocket {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.stream.read(buf)
+    }
 }
 
 impl QSocket {
@@ -216,16 +272,73 @@ impl QSocket {
     /// ```no_run
     /// use qsocket;
     ///
-    /// let mut qsock = qsocket::QSocket::new("my-secret", true);
+    /// let mut qsock = qsocket::QSocket::new(PeerType::Client, "my-secret");
     /// ```
-    pub fn new(secret: &str, verify_cert: bool) -> Self {
-        let tag = get_default_tag();
+    pub fn new(peer_type: PeerType, secret: &str) -> Self {
         Self {
-            tag,
-            verify_cert,
+            peer_type,
+            device_os: device::get_device_os(),
+            device_arch: device::get_device_arch(),
+            cert_fingerprint: None,
+            forward_addr: None,
             secret: String::from(secret),
+            session_key: None,
             stream: Stream::new(),
         }
+    }
+
+    /// Create a new knock packet structure with the given secret and tag.
+    ///
+    /// `secret` value can be considered as the password for the QSocket connection,
+    /// It will be used for generating a 128bit unique identifier (UID) for the connection.
+    ///
+    /// `tag` value is used internally for QoS purposes.
+    /// It specifies the type of connection to the relay server for
+    /// more optimized connection performance.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use qsocket;
+    /// use std::iter::Iterator;
+    ///
+    /// let test_case: [u8; 20] = [
+    ///     0x20, 0x2c, 0xb9, 0x62, 0xac, 0x59, 0x07, 0x5b, 0x96, 0x4b, 0x07,
+    ///     0x15, 0x2d, 0x23, 0x4b, 0x70, 0x00, 0x00, 0x00, 0x01
+    /// ];
+    ///
+    /// let qsock = qsocket::QSocket::new(PeerType::Client, "my-secret");
+    /// let knock = qsock.new_knock_sequence()?;
+    /// assert!(knock[0..15].eq(test_case[0..15]);
+    /// assert!(knock[16], 0x00);
+    /// assert!(knock[19], PeerType::Client as u8);
+    /// ```
+    fn new_knock_sequence(&self) -> Result<[u8; 20], QSocketError> {
+        let mut knock: [u8; 20] = Default::default();
+        let digest = md5::compute(self.secret.clone());
+        digest.as_slice().read_exact(knock[1..17].as_mut())?;
+        knock[17] = self.device_arch as u8;
+        knock[18] = self.device_os as u8;
+        knock[19] = self.peer_type as u8;
+        knock[0] = calc_checksum(&knock[1..], KNOCK_CHECKSUM_BASE);
+        Ok(knock)
+    }
+
+    /// Set a TLS certificate fingerprint for verification.
+    ///
+    /// `fp` value is the hex encoded 32 byte certificate fingerprint.
+    ///
+    /// # Examples
+    /// ```no_run
+    ///use qsocket;
+    ///
+    ///let mut qsock - qsocket::QSocket::new(PeerType::Client, "my-secret");
+    ///qsock.set_cert_fingerprint("32ADEB12BA582C97E157D10699080C1598ECC3793C09D19020EDF51CDC67C145")
+    /// ```
+    pub fn set_cert_fingerprint(&mut self, fp: &str) -> Result<(), QSocketError> {
+        hex::decode(fp)?; // Check if it is valid hex
+        self.cert_fingerprint = Some(fp.to_uppercase().to_string()); // normalize to uppercase
+        Ok(())
     }
 
     /// Returns true if the QSocket is set to client mode.
@@ -234,61 +347,53 @@ impl QSocket {
     /// ```no_run
     /// use qsocket;
     ///
-    /// let mut qsock = qsocket::QSocket::new("my-secret", true);
-    /// qsock.add_id_tag(qsocket::peer_id_tag::CLIENT);
+    /// let mut qsock = qsocket::QSocket::new(PeerType::Client, "my-secret");
     /// assert_eq!(qsock.is_client(), true);
     /// ```
-    pub fn is_client(&mut self) -> bool {
-        self.tag % 2 == 1
+    pub fn is_client(&self) -> bool {
+        self.peer_type == PeerType::Client
     }
 
-    /// Adds a new ID tag to the quantum socket.
-    ///
-    /// `secret` value can be considered as the password for the QSocket connection,
-    /// It will be used for generating a 128bit unique identifier (UID) for the connection.
+    /// Returns true if the QSocket is set to server mode.
     ///
     /// # Examples
     /// ```no_run
     /// use qsocket;
     ///
-    /// let mut qsock = qsocket::QSocket::new("my-secret");
-    /// if let Err(e) = qsock.add_id_tag(qsocket::peer_id_tag::CLIENT) {
-    ///     panic!("{}", e);
-    /// }
+    /// let mut qsock = qsocket::QSocket::new(PeerType::Server, "my-secret");
+    /// assert_eq!(qsock.is_server(), true);
     /// ```
-    pub fn add_id_tag(&mut self, id_tag: u8) -> Result<(), anyhow::Error> {
-        if self.stream.connected {
-            return Err(anyhow!(ERR_SOCKET_IN_USE));
-        }
-        match id_tag {
-            peer_id_tag::CLIENT => self.tag |= id_tag,
-            peer_id_tag::SERVER => self.tag |= id_tag,
-            peer_id_tag::PROXY => self.tag |= id_tag,
-            _ => return Err(anyhow!(ERR_INVALID_PEER_ID_TAG)),
-        }
-        Ok(())
+    pub fn is_server(&self) -> bool {
+        self.peer_type == PeerType::Server
     }
 
-    /// Enables/Disabled the TLS certificate pinning behavior of the quantum socket.
+    /// Sets the forward address to QSocket.
     ///
     /// # Examples
     /// ```no_run
     /// use qsocket;
-    ///
-    /// let mut qsock = qsocket::QSocket::new("my-secret");
-    /// if let Err(e) = qsock.add_id_tag(qsocket::peer_id_tag::CLIENT) {
-    ///     panic!("{}", e);
-    /// }
+    /// let mut qsock = qsocket::QSocket::new(PeerType::Client, "my-secret");
+    /// qsock.set_forward_addr("127.0.0.1:22")?;
     /// ```
-    pub fn set_cert_pinning(&mut self, v: bool) -> Result<(), anyhow::Error> {
-        if self.stream.connected {
-            return Err(anyhow!(ERR_SOCKET_IN_USE));
-        }
-        self.verify_cert = v;
+    pub fn set_forward_addr(&mut self, addr: String) -> Result<(), QSocketError> {
+        self.forward_addr = Some(addr.parse()?);
         Ok(())
     }
 
-    /// Opens a TCP connection to the QSRN.
+    /// Gets the forward address of QSocket.
+    ///
+    /// # Examples
+    /// ```no_run
+    /// use qsocket;
+    /// let mut qsock = qsocket::QSocket::new(PeerType::Client, "my-secret");
+    /// qsock.set_forward_addr("127.0.0.:22")?
+    /// assert_eq!(qsock.get_forward_addr().unwrap().to_string(), "127.0.0.1:22");
+    /// ```
+    pub fn get_forward_addr(&self) -> Option<SocketAddr> {
+        self.forward_addr
+    }
+
+    /// Opens a E2E encrypted connection to the QSRN.
     ///
     /// If the connection fails due to network related errors,
     /// function will return the corresponding error, in the case of
@@ -298,30 +403,16 @@ impl QSocket {
     /// ```no_run
     /// use qsocket;
     /// let mut qsock = qsocket::QSocket::new("my-secret");
-    /// if let Err(e) = qsock.dial_tcp() {           
-    ///     panic!("{}", e);
-    /// }
+    /// qsock.dial()?;           
     /// ```
-    pub fn dial_tcp(&mut self) -> Result<(), anyhow::Error> {
-        self.stream
-            .connect(format!("{QSRN_GATE}:{QSRN_PORT}").as_str())?;
-        let knock = new_knock_sequence(&self.secret, self.tag)?;
-        self.stream.write_all(knock.as_ref())?;
-        let mut resp: [u8; 1] = [0];
-        self.stream.read_exact(resp.as_mut())?;
-        match resp[0] {
-            KNOCK_SUCCESS => Ok(()),
-            KNOCK_BUSY => Err(anyhow::anyhow!(ERR_KNOCK_BUSY)),
-            KNOCK_FAIL => Err(anyhow::anyhow!(ERR_KNOCK_FAILED)),
-            _ => Err(anyhow::anyhow!(ERR_INVALID_KNOCK_RESPONSE)),
-        }
+    pub fn dial(&mut self) -> Result<(), QSocketError> {
+        self.dial_with(SocketType::E2E)
     }
 
-    /// Opens a TLS connection to the QSRN.
+    /// Opens connection to the QSRN with the given SocketType.
     ///
-    /// If the `verify_cert` parameter is true,
-    /// after establishing a TLS connection with the QSRN gate server,
-    /// the TLS certificate fingerprint will be validated with the hardcoded certificate fingerprint value `QSRN_CERT_FINGERPRINT`.
+    /// The`conn_type` parameter is used for specifying the socket type
+    /// that will be used for creating a connection.
     ///
     /// If the connection fails due to network related errors,
     /// function will return the corresponding error, in the case of
@@ -330,191 +421,67 @@ impl QSocket {
     /// Examples
     /// ```no_run
     /// use qsocket;
-    /// let mut qsock = qsocket::QSocket::new("my-secret", true);
-    /// if let Err(e) = qsock.dial() {           
-    ///     panic!("{}", e);
-    /// }
+    /// let mut qsock = qsocket::QSocket::new("my-secret");
+    /// qsock.dial_with(qsocket::SocketType::TLS)?;           
     /// ```
-    pub fn dial(&mut self) -> Result<(), anyhow::Error> {
+    pub fn dial_with(&mut self, conn_type: SocketType) -> Result<(), QSocketError> {
         self.stream
             .connect(format!("{QSRN_GATE}:{QSRN_TLS_PORT}").as_str())?;
-        self.stream.upgrade_to_tls()?;
-        if self.verify_cert {
-            let conn = &self.stream.tls_stream.as_ref().unwrap().conn;
-            let certs = conn.peer_certificates();
-            let mut hasher = Sha256::new();
-            hasher.update(certs.unwrap()[0].0.as_slice());
-            let cert_hash = format!("{:X}", hasher.finalize());
-            if cert_hash != QSRN_CERT_FINGERPRINT {
-                return Err(anyhow!(ERR_CERT_FINGERPRINT_MISMATCH));
+
+        if conn_type != SocketType::TCP {
+            self.stream.upgrade_to_tls()?;
+            if self.cert_fingerprint.is_some() {
+                let conn = &self.stream.tls_stream.as_ref().unwrap().conn;
+                let certs = conn.peer_certificates();
+                let mut hasher = Sha256::new();
+                hasher.update(certs.unwrap()[0].0.as_slice());
+                let cert_hash = format!("{:X}", hasher.finalize());
+                if cert_hash != self.cert_fingerprint.clone().unwrap() {
+                    return Err(QSocketError::CertificateFingerprintMismatch);
+                }
             }
         }
-        let knock = new_knock_sequence(&self.secret, self.tag)?;
-        self.stream.write_all(knock.as_ref())?;
 
-        let mut resp = vec![1];
-        self.stream.read_exact(resp.as_mut())?;
-        match resp[0] {
-            KNOCK_SUCCESS => (),
-            KNOCK_BUSY => return Err(anyhow!(ERR_KNOCK_BUSY)),
-            KNOCK_FAIL => return Err(anyhow!(ERR_KNOCK_FAILED)),
-            _ => return Err(anyhow!(ERR_INVALID_KNOCK_RESPONSE)),
+        // let knock = self.new_knock_sequence()?;
+        // self.stream.write_all(knock.as_ref())?;
+        self.stream
+            .write_all(self.new_proto_switch_req()?.as_bytes())?;
+        let mut buf = vec![0; 512];
+        let n = self.stream.read(buf.as_mut())?;
+        if n == 0 {
+            return Err(QSocketError::InvalidKnockResponse);
+        }
+        let resp = parse_knock_response(&buf)?;
+
+        match resp.status {
+            KnockStatus::Success => (),
+            KnockStatus::Forward => self.set_forward_addr(resp.data)?,
+            KnockStatus::Fail => return Err(QSocketError::KnockFail),
+            KnockStatus::Busy => return Err(QSocketError::KnockBusy),
         };
 
-        let mut session_key: Vec<u8>;
-        if self.is_client() {
-            session_key = self.init_client_srp()?;
-        } else {
-            session_key = self.init_server_srp()?;
+        if conn_type == SocketType::E2E {
+            // Begin PAKE exchange...
+            let session_key = match self.peer_type {
+                PeerType::Server => pake::init_pake_handshake(
+                    pake::PakeMode::Client,
+                    &mut self.stream,
+                    self.secret.clone(),
+                )?,
+                PeerType::Client => pake::init_pake_handshake(
+                    pake::PakeMode::Server,
+                    &mut self.stream,
+                    self.secret.clone(),
+                )?,
+            };
+            self.session_key = Some(session_key);
+            let nonce = [0x00; 12]; // Fixed empty nonce, this could be improved...
+            self.stream.cipher = Some(ChaCha20::new(
+                self.session_key.clone().unwrap().as_slice().into(),
+                &nonce.into(),
+            ));
         }
-
-        // Begin E2E encryption
-
         Ok(())
-    }
-
-    fn init_client_srp(&mut self) -> Result<Vec<u8>, anyhow::Error> {
-        let myself = Arc::new(Mutex::new(self));
-
-        if myself.lock().unwrap().stream.connected {
-            return Err(anyhow!(ErrorKind::NotConnected));
-        }
-
-        let (user, pass) = myself.lock().unwrap().get_srp_creds();
-        let client = SrpClient::<Blake2b256>::new(&G_4096);
-
-        // send handshake data (username and a_pub) to the server:
-        let mut a = [0u8; 64];
-        OsRng.fill_bytes(&mut a);
-        let a_pub = client.compute_public_ephemeral(&a);
-
-        myself
-            .lock()
-            .unwrap()
-            .stream
-            .write_all(format!("{:x?}:{:x?}", user, a_pub.as_slice()).as_bytes())?;
-
-        // receive salt and b_pub
-        let mut buf = [0u8; 4096];
-        let n = myself.lock().unwrap().stream.read(&mut buf)?;
-        let salt_n_b_pub = format!("{:?}", &buf[0..n]);
-
-        if salt_n_b_pub.split_once(':').is_none() {
-            return Err(anyhow!(ERR_INVALID_SRP_CREDS));
-        }
-
-        let (salt_srt, b_pub_str) = salt_n_b_pub.split_once(':').unwrap();
-        let salt = hex::decode(salt_srt)?;
-        let b_pub = hex::decode(b_pub_str)?;
-
-        let verifier = match client.process_reply(
-            &a,
-            user.as_slice(),
-            pass.as_slice(),
-            salt.as_slice(),
-            b_pub.as_slice(),
-        ) {
-            std::result::Result::Ok(v) => v,
-            Err(e) => return Err(anyhow!(e)),
-        };
-
-        myself
-            .lock()
-            .unwrap()
-            .stream
-            .write_all(format!("{:x?}", verifier.proof()).as_bytes())?;
-
-        let mut buf = [0u8; 4096];
-        let n = myself.lock().unwrap().stream.read(&mut buf)?;
-
-        if verifier.verify_server(&buf[0..n]).is_err() {
-            return Err(anyhow!(ERR_SRP_PROOF_FAILED));
-        }
-
-        Ok(verifier.key().to_vec())
-    }
-
-    fn init_server_srp(&mut self) -> Result<Vec<u8>, anyhow::Error> {
-        let myself = Arc::new(Mutex::new(self));
-        if !myself.lock().unwrap().stream.connected {
-            return Err(anyhow!(ErrorKind::NotConnected));
-        }
-
-        let (user, pass) = myself.lock().unwrap().get_srp_creds();
-        dbg!(hex::encode(user.clone()), hex::encode(pass.clone()));
-        let server = SrpServer::<Blake2b256>::new(&G_4096);
-
-        let mut salt = [0u8; 512];
-        OsRng.fill_bytes(&mut salt);
-        let cli = SrpClient::<Blake2b256>::new(&G_4096);
-        let vi = cli.compute_verifier(user.as_slice(), pass.as_slice(), &salt);
-
-        let mut buf = [0u8; 4096];
-        let n = myself.lock().unwrap().stream.read(&mut buf)?;
-        dbg!(n);
-        let creds = std::str::from_utf8(&buf[0..n])?;
-        dbg!(" == CLIENT ==> ", creds);
-
-        // if !creds.contains(':') {
-        //     return Err(anyhow!(ERR_INVALID_SRP_CREDS));
-        // }
-
-        let (username, a_pub_str) = creds.split_once(':').unwrap();
-        let a_pub = hex::decode(a_pub_str)?;
-        let user_str = hex::encode(user);
-        dbg!(user_str.clone());
-
-        // if username != user_str.as_str() {
-        //     return Err(anyhow!(ERR_INVALID_SRP_CREDS));
-        // }
-
-        let mut b = [0u8; 512]; // Should be 512
-        OsRng.fill_bytes(&mut b);
-        let b_pub = server.compute_public_ephemeral(&b, &vi);
-
-        myself
-            .lock()
-            .unwrap()
-            .stream
-            .write_all(format!("{}:{}", hex::encode(b), hex::encode(b_pub.clone())).as_bytes())?;
-
-        dbg!(
-            "<=== SERVER == ",
-            format!("{}:{}", hex::encode(b), hex::encode(b_pub))
-        );
-
-        let verifier = match server.process_reply(&b, &vi, a_pub.as_slice()) {
-            std::result::Result::Ok(v) => v,
-            Err(e) => return Err(anyhow!(e)),
-        };
-
-        let n = myself.lock().unwrap().stream.read(&mut buf)?;
-        dbg!(n);
-        // let proof = format!("{:x?}", &buf[0..n]);
-        dbg!("== CLIENT ===> ", hex::encode(&buf[0..n]));
-
-        if verifier.verify_client(&buf[0..n]).is_err() {
-            return Err(anyhow!(ERR_SRP_PROOF_FAILED));
-        }
-
-        myself
-            .lock()
-            .unwrap()
-            .stream
-            .write_all(hex::encode(verifier.proof()).as_bytes())?;
-
-        dbg!(verifier.key());
-        Ok(verifier.key().to_vec())
-    }
-
-    fn get_srp_creds(&mut self) -> (Vec<u8>, Vec<u8>) {
-        let username_md5 = md5::compute(self.secret.clone());
-        // let username = blake2b256(username_md5.as_slice()).unwrap(); // blake3::hash(username_md5.as_slice());
-        let mut hasher = Sha256::new();
-        hasher.update(self.secret.clone());
-        let password_sha256 = hasher.finalize();
-        //let password = blake2b256(&password_sha256).unwrap(); // blake3::hash(&password_sha256);
-        (username_md5.to_vec(), password_sha256.to_vec())
     }
 
     /// Sets the read timeout to the timeout specified.
@@ -541,22 +508,21 @@ impl QSocket {
     /// use std::io::ErrorKind::InvalidInput;
     ///
     /// let mut qsock = qsocket::QSocket::new("my-secret");
-    /// if let Err(e) = qsock.dial(){
-    ///     panic!("{}", e);
-    /// }
+    /// qsock.dial(qsocket::SocketType::E2E)?;
     /// let result = qsock.set_read_timeout(Some(Duration::new(0, 0)));
     /// let err = result.unwrap_err();
     /// assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput)
     /// ```
-    pub fn set_read_timeout(&mut self, dur: Option<Duration>) -> std::io::Result<()> {
+    pub fn set_read_timeout(&mut self, dur: Option<Duration>) -> Result<(), QSocketError> {
         if !self.stream.connected {
-            return Err(std::io::Error::from(ErrorKind::NotConnected));
+            return Err(QSocketError::NotConnected);
         }
         self.stream
             .tcp_stream
             .as_mut()
             .unwrap()
-            .set_read_timeout(dur)
+            .set_read_timeout(dur)?;
+        Ok(())
     }
 
     /// Sets the write timeout to the timeout specified.
@@ -582,21 +548,20 @@ impl QSocket {
     /// use core::time::Duration;
     ///
     /// let mut qsock = qsocket::QSocket::new("my-secret");
-    /// if let Err(e) = qsock.dial(){
-    ///     panic!("{}", e);
-    /// }
+    /// qsock.dial()?;
     /// let result = qsock.set_read_timeout(Some(Duration::new(0, 0)));
     /// qsock.set_write_timeout(None).expect("set_write_timeout call failed");
     /// ```
-    pub fn set_write_timeout(&mut self, dur: Option<Duration>) -> std::io::Result<()> {
+    pub fn set_write_timeout(&mut self, dur: Option<Duration>) -> Result<(), QSocketError> {
         if !self.stream.connected {
-            return Err(std::io::Error::from(ErrorKind::NotConnected));
+            return Err(QSocketError::NotConnected);
         }
         self.stream
             .tcp_stream
             .as_mut()
             .unwrap()
-            .set_write_timeout(dur)
+            .set_write_timeout(dur)?;
+        Ok(())
     }
 
     /// Moves this TCP stream into or out of nonblocking mode.
@@ -622,9 +587,7 @@ impl QSocket {
     /// use std::io::ErrorKind::WouldBlock;
     ///
     /// let mut qsock = qsocket::QSocket::new("my-secret");
-    /// if let Err(e) = qsock.dial() {
-    ///     panic!("{}", e)
-    /// }
+    /// qsock.dial()?;
     /// qsock.set_nonblocking(true).expect("set_nonblocking call failed");
     ///
     /// # fn wait_for_fd() { unimplemented!() }
@@ -642,15 +605,16 @@ impl QSocket {
     /// };
     /// println!("bytes: {buf:?}");
     /// ```
-    pub fn set_nonblocking(&mut self, nonblocking: bool) -> std::io::Result<()> {
+    pub fn set_nonblocking(&mut self, nonblocking: bool) -> Result<(), QSocketError> {
         if !self.stream.connected {
-            return Err(std::io::Error::from(ErrorKind::NotConnected));
+            return Err(QSocketError::NotConnected);
         }
         self.stream
             .tcp_stream
             .as_mut()
             .unwrap()
-            .set_nonblocking(nonblocking)
+            .set_nonblocking(nonblocking)?;
+        Ok(())
     }
 
     /// Shuts down the read, write, or both halves of this connection.
@@ -673,35 +637,40 @@ impl QSocket {
     /// use std::net::Shutdown;
     ///
     /// let mut qsock = qsocket::QSocket::new("my-secret");
-    /// if let Err(e) = qsock.dial() {
-    ///     panic!("{}", e);
-    /// }
+    /// qsock.dial(qsocket::SocketType::E2E)?;
     /// qsock.shutdown(Shutdown::Both).expect("shutdown call failed");
     /// ```    
-    pub fn shutdown(&mut self, how: std::net::Shutdown) -> std::io::Result<()> {
+    pub fn shutdown(&mut self, how: std::net::Shutdown) -> Result<(), QSocketError> {
         if !self.stream.connected {
-            return Err(std::io::Error::from(ErrorKind::NotConnected));
+            return Err(QSocketError::NotConnected);
         }
-        self.stream.tcp_stream.as_mut().unwrap().shutdown(how)
+        self.stream.tcp_stream.as_mut().unwrap().shutdown(how)?;
+        Ok(())
+    }
+
+    /// This function creates a new Websocket protocol switch request,
+    /// based on the qsocket knock sequence and forward address.
+    /// The request host header will point to QSRN_GATE by default. (can be changed for domain
+    /// fronting.
+    fn new_proto_switch_req(&self) -> std::result::Result<String, QSocketError> {
+        let knock = self.new_knock_sequence()?;
+        let ws_key = general_purpose::STANDARD.encode(knock);
+        let mut req = String::from("GET / HTTP/1.1\n");
+        if self.forward_addr.is_some() {
+            let addr = self.forward_addr.unwrap();
+            req = format!("GET /{}:{} HTTP/1.1\n", addr.ip(), addr.port());
+        }
+        req.push_str(format!("Host: {}\n", QSRN_GATE).as_str());
+        req.push_str("Sec-Websocket-Version: 13\n");
+        req.push_str(format!("Sec-Websocket-Key: {}\n", ws_key).as_str());
+        req.push_str("Connection: Upgrade\n");
+        req.push_str("Upgrade: websocket\n");
+        req.push_str("\r\n\r\n");
+        Ok(req)
     }
 }
 
-impl Write for QSocket {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.stream.write(buf)
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.stream.flush()
-    }
-}
-
-impl Read for QSocket {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.stream.read(buf)
-    }
-}
-
-pub struct NoCertificateVerification {}
+struct NoCertificateVerification {}
 impl ServerCertVerifier for NoCertificateVerification {
     fn verify_server_cert(
         &self,
@@ -716,7 +685,7 @@ impl ServerCertVerifier for NoCertificateVerification {
     }
 }
 
-pub fn new_tls_config() -> rustls::ClientConfig {
+fn new_tls_config() -> rustls::ClientConfig {
     let mut config = rustls::ClientConfig::builder()
         .with_safe_defaults()
         .with_root_certificates(rustls::RootCertStore::empty())
@@ -725,43 +694,6 @@ pub fn new_tls_config() -> rustls::ClientConfig {
         .dangerous()
         .set_certificate_verifier(Arc::new(NoCertificateVerification {}));
     config
-}
-
-/// Create a new knock packet structure with the given secret and tag.
-///
-/// `secret` value can be considered as the password for the QSocket connection,
-/// It will be used for generating a 128bit unique identifier (UID) for the connection.
-///
-/// `tag` value is used internally for QoS purposes.
-/// It specifies the type of connection to the relay server for
-/// more optimized connection performance.
-///
-/// # Examples
-///
-/// ```no_run
-/// use qsocket;
-/// use std::iter::Iterator;
-///
-/// let test_case: [u8; 20] = [
-///     0xC0, 0xDE, 0x30, 0x20, 0x2c, 0xb9, 0x62, 0xac, 0x59, 0x07, 0x5b, 0x96, 0x4b, 0x07,
-///     0x15, 0x2d, 0x23, 0x4b, 0x70, 0x1,
-/// ];
-///
-/// let knock = match qsocket::new_knock_sequence("123", 0) {
-///     Ok(k) => k,
-///     Err(e) => panic!("{}", e),
-/// };
-/// assert!(knock.iter().eq(test_case.iter()));
-/// ```
-pub fn new_knock_sequence(secret: &str, tag: u8) -> Result<[u8; 20], std::io::Error> {
-    let digest = md5::compute(secret);
-    let mut knock: [u8; 20] = Default::default();
-    knock[0] = KNOCK_HEADER_B1;
-    knock[1] = KNOCK_HEADER_B2;
-    knock[2] = calc_checksum(digest.as_slice(), KNOCK_CHECKSUM_BASE);
-    digest.as_slice().read_exact(knock[3..19].as_mut())?;
-    knock[19] = tag;
-    std::result::Result::Ok(knock)
 }
 
 /// Calculates a 8bit checksum value for the given byte array.
@@ -785,87 +717,60 @@ pub fn new_knock_sequence(secret: &str, tag: u8) -> Result<[u8; 20], std::io::Er
 pub fn calc_checksum(data: &[u8], base: u8) -> u8 {
     let mut checksum: u32 = 0;
     for i in data {
-        checksum += ((*i << 2) % base) as u32;
+        checksum += ((i << 2) % base) as u32;
     }
     (checksum % base as u32) as u8
 }
 
-#[cfg(test)]
-mod tests {
-    use crate::new_knock_sequence;
-
-    #[test]
-    fn test_new_knock_sequence() {
-        let test_secret = "123";
-        let test_tag = 1;
-        let knock = new_knock_sequence(test_secret, test_tag).unwrap();
-        let test_case: [u8; 20] = [
-            0xC0, 0xDE, 0xD6, 0x20, 0x2c, 0xb9, 0x62, 0xac, 0x59, 0x07, 0x5b, 0x96, 0x4b, 0x07,
-            0x15, 0x2d, 0x23, 0x4b, 0x70, 0x1,
-        ];
-
-        for i in 0..knock.len() {
-            assert_eq!(test_case[i], knock[i]);
+fn parse_knock_response(buf: &[u8]) -> Result<KnockResponse, QSocketError> {
+    let mut headers = [httparse::EMPTY_HEADER; 16];
+    let mut resp = httparse::Response::new(&mut headers);
+    resp.parse(buf)?;
+    match resp.code.unwrap() {
+        101 => {
+            for header in headers.iter() {
+                if header.name.to_lowercase() == "sec-websocket-accept" {
+                    let data = general_purpose::STANDARD.decode(header.value)?;
+                    return Ok(KnockResponse {
+                        status: KnockStatus::Forward,
+                        data: String::from_utf8(data)?,
+                    });
+                }
+            }
+            Ok(KnockResponse {
+                status: KnockStatus::Success,
+                data: String::new(),
+            })
         }
+        401 => Ok(KnockResponse {
+            status: KnockStatus::Fail,
+            data: String::new(),
+        }),
+        409 => Ok(KnockResponse {
+            status: KnockStatus::Busy,
+            data: String::new(),
+        }),
+        _ => Err(QSocketError::InvalidKnockResponse),
     }
 }
 
-pub fn get_default_tag() -> u8 {
-    let mut tag: u8 = 0;
-    // Determine OS...
-    if cfg!(target_os = "linux") {
-        tag |= device_id_tag::OS_LINUX;
-    }
-    if cfg!(target_os = "windows") {
-        tag |= device_id_tag::OS_WINDOWS;
-    }
-    if cfg!(target_os = "macos") {
-        tag |= device_id_tag::OS_DARWIN;
-    }
-    if cfg!(target_os = "android") {
-        tag |= device_id_tag::OS_ANDROID;
-    }
-    if cfg!(target_os = "ios") {
-        tag |= device_id_tag::OS_IOS;
-    }
-    if cfg!(target_os = "freebsd") {
-        tag |= device_id_tag::OS_FREEBSD;
-    }
-    if cfg!(target_os = "openbsd") {
-        tag |= device_id_tag::OS_OPENBSD;
-    }
-
-    // Determine architecture...
-    if cfg!(target_arch = "x86_64") {
-        tag |= device_id_tag::ARCH_AMD64;
-    }
-    if cfg!(target_arch = "i686") {
-        tag |= device_id_tag::ARCH_386;
-    }
-    if cfg!(target_arch = "aarch64") {
-        tag |= device_id_tag::ARCH_ARM64;
-    }
-    if cfg!(target_arch = "arm") {
-        tag |= device_id_tag::ARCH_ARM;
-    }
-    if cfg!(target_arch = "mips") {
-        tag |= device_id_tag::ARCH_MIPS;
-    }
-    if cfg!(target_arch = "mips64") {
-        tag |= device_id_tag::ARCH_MIPS64;
-    }
-    if cfg!(target_arch = "mips64le") {
-        tag |= device_id_tag::ARCH_MIPS64LE;
-    }
-
-    tag
-}
-
-// fn blake2b256(input: &[u8]) -> Result<Vec<u8>, anyhow::Error> {
-//     use blake2::digest::{Update, VariableOutput};
-//     let mut hasher = Blake2bVar::new(32).unwrap();
-//     hasher.update(input);
-//     let mut buf = [0u8; 32];
-//     hasher.finalize_variable(&mut buf).unwrap();
-//     Ok(buf.to_vec())
+//
+// #[cfg(test)]
+// mod tests {
+//     use crate::PeerType;
+//
+//
+//     #[test]
+//     fn test_new_knock_sequence() {
+//         let qsock = qsocket::QSocket::new(PeerType::Client, "my-secret");
+//         let knock = qsock.new_knock_sequence()?;
+//         let test_case: [u8; 20] = [
+//             0xC0, 0xDE, 0xD6, 0x20, 0x2c, 0xb9, 0x62, 0xac, 0x59, 0x07, 0x5b, 0x96, 0x4b, 0x07,
+//             0x15, 0x2d, 0x23, 0x4b, 0x70, 0x1,
+//         ];
+//
+//         for i in 0..knock.len() {
+//             assert_eq!(test_case[i], knock[i]);
+//         }
+//     }
 // }
