@@ -1,5 +1,6 @@
 #[repr(u8)]
 #[derive(Copy, Clone)]
+#[allow(dead_code)]
 pub enum DeviceArch {
     Unknown = 0,
     I686,
@@ -30,6 +31,7 @@ pub enum DeviceArch {
 
 #[repr(u8)]
 #[derive(Copy, Clone)]
+#[allow(dead_code)]
 pub enum DeviceOS {
     Unknown = 0,
     Linux,
