@@ -43,7 +43,7 @@ where
     }
 
     sock.write_all(&outbound_msg)?;
-    let mut inbound_msg = vec![0; 512];
+    let mut inbound_msg = vec![0; 1024];
     let n = sock.read(&mut inbound_msg)?;
     let key = state.unwrap().finish(&inbound_msg[..n]);
     if key.is_err() {

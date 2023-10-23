@@ -446,7 +446,7 @@ impl QSocket {
         // self.stream.write_all(knock.as_ref())?;
         self.stream
             .write_all(self.new_proto_switch_req()?.as_bytes())?;
-        let mut buf = vec![0; 512];
+        let mut buf = vec![0; 4096];
         let n = self.stream.read(buf.as_mut())?;
         if n == 0 {
             return Err(QSocketError::InvalidKnockResponse);
@@ -665,7 +665,7 @@ impl QSocket {
         req.push_str(format!("Sec-Websocket-Key: {}\n", ws_key).as_str());
         req.push_str("Connection: Upgrade\n");
         req.push_str("Upgrade: websocket\n");
-        req.push_str("\r\n\r\n");
+        req.push_str("\r\n");
         Ok(req)
     }
 }
