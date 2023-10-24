@@ -1,6 +1,6 @@
 [package]
 name = "qsocket"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 authors = ["Ege BALCI <egebalci@pm.me>"]
 description = "QSocket library."
